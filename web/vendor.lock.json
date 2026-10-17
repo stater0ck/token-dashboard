@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Integrity pins for third-party files vendored under web/.",
+    "Enforced two ways: token_dashboard/vendor.py verifies a locked file the first",
+    "time the server serves it, and tests/test_hardening.py asserts the same digests",
+    "without starting the server. Either one fails loudly if a file changes.",
+    "To upgrade an asset on purpose: replace the file, verify the new bytes against",
+    "the upstream URL below, then update sha256 and bytes here in the same commit."
+  ],
+  "assets": {
+    "echarts.min.js": {
+      "name": "Apache ECharts",
+      "version": "5.5.0",
+      "license": "Apache-2.0",
+      "bundled": [
+        "zrender (BSD-3-Clause)",
+        "tslib runtime helpers (0BSD, Microsoft)"
+      ],
+      "sha256": "42f8329d989b6f6539dd2b15bbdf0d82025762ac112fbb60dc57b27d7bcf3946",
+      "bytes": 1029203,
+      "upstream": "https://registry.npmjs.org/echarts/-/echarts-5.5.0.tgz (dist/echarts.min.js)",
+      "verify": "shasum -a 256 web/echarts.min.js",
+      "provenance": "UNVERIFIED. This digest was captured from the working tree on 2026-09-10 to freeze the bytes currently in the repo. It has not been compared against the upstream tarball, so it pins the file against accidental change but does not attest that these bytes are genuine upstream ECharts. Compare once against the upstream URL, then change this field to record the date it was verified."
+    }
+  }
+}

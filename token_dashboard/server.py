@@ -4,6 +4,7 @@ from __future__ import annotations
 import http.server
 import json
 import mimetypes
+import os
 import queue
 import threading
 import time
@@ -21,6 +22,7 @@ from .pricing import load_pricing, cost_for, get_plan, set_plan
 from .tips import all_tips, dismiss_tip
 from .scanner import scan_dir
 from .skills import cached_catalog
+from . import vendor
 
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
@@ -30,6 +32,9 @@ EVENTS: "queue.Queue[dict]" = queue.Queue()
 
 MAX_POST_BYTES = 1_000_000  # 1 MB — we only accept tiny JSON bodies (plan, tip key)
 MAX_LIMIT = 1000
+
+LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+WILDCARD_BINDS = frozenset({"0.0.0.0", "::", "*", ""})
 
 
 def _send_json(handler, obj, status: int = 200) -> None:
@@ -54,13 +59,69 @@ def _clamp_limit(raw, default: int) -> int:
     return max(1, min(v, MAX_LIMIT))
 
 
+def _hostname(authority: str) -> str:
+    """Hostname from a Host or Origin authority, minus port and IPv6 brackets."""
+    h = (authority or "").strip().lower()
+    if h.startswith("["):
+        return h[1:].split("]", 1)[0]
+    if h.count(":") == 1:  # host:port (a bare IPv6 literal has 2+ colons)
+        return h.split(":", 1)[0]
+    return h
+
+
+def allowed_hostnames(bind_host: str = "127.0.0.1") -> frozenset:
+    """Hostnames a browser may legitimately use to reach this dashboard.
+
+    Any other Host header means the request arrived under a name that resolves
+    to this machine but that we never advertised. That is the signature of DNS
+    rebinding, the technique a web page uses to defeat same-origin policy and
+    read a loopback API. Since every /api/* response carries prompt text, file
+    paths, or project names, an unrecognized Host is refused before routing.
+
+    Ports are deliberately not pinned. Rebinding needs an attacker-controlled
+    hostname, so a port match adds nothing, and requiring one would break SSH
+    forwarding (localhost:9999 to 8080).
+
+    Set TOKEN_DASHBOARD_ALLOWED_HOSTS (comma-separated) to reach the dashboard
+    under another name, for example a LAN IP when you have deliberately bound
+    0.0.0.0. Read once at startup.
+    """
+    hosts = set(LOOPBACK_HOSTNAMES)
+    bind = _hostname(bind_host)
+    if bind not in WILDCARD_BINDS:
+        hosts.add(bind)
+    for extra in (os.environ.get("TOKEN_DASHBOARD_ALLOWED_HOSTS") or "").split(","):
+        name = _hostname(extra)
+        if name:
+            hosts.add(name)
+    return frozenset(hosts)
+
+
+def _within(child: Path, parent: Path) -> bool:
+    """True if `child` is `parent` or sits underneath it.
+
+    A `str.startswith` prefix test would also accept a sibling whose name
+    merely starts with the parent's (web/ vs web-assets/), so compare path
+    components instead.
+    """
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def _serve_static(handler, rel: str) -> None:
     rel = rel.lstrip("/")
+    root = WEB_ROOT.resolve()
     p = (WEB_ROOT / rel).resolve()
-    if not str(p).startswith(str(WEB_ROOT.resolve())) or not p.is_file():
+    if not _within(p, root) or not p.is_file():
         handler.send_response(404)
         handler.end_headers()
         return
+    err = vendor.check(p.relative_to(root).as_posix(), p)
+    if err:
+        return _send_error(handler, 500, err)
     body = p.read_bytes()
     ctype, _ = mimetypes.guess_type(str(p))
     handler.send_response(200)
@@ -70,17 +131,38 @@ def _serve_static(handler, rel: str) -> None:
     handler.wfile.write(body)
 
 
-def build_handler(db_path: str, projects_dir: str):
+def build_handler(db_path: str, projects_dir: str, bind_host: str = "127.0.0.1"):
     pricing = load_pricing(PRICING_JSON)
+    allowed = allowed_hostnames(bind_host)
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
 
+        def _guard(self) -> bool:
+            """Refuse rebound and cross-origin requests before any dispatch.
+
+            Sends the error response itself and returns False when the request
+            should not be served. See `allowed_hostnames` for the reasoning.
+            """
+            if _hostname(self.headers.get("Host") or "") not in allowed:
+                _send_error(self, 421, "unrecognized Host header")
+                return False
+            origin = self.headers.get("Origin")
+            # Browsers send Origin on same-origin POSTs too, so an Origin that
+            # resolves to an allowed hostname is fine. Anything else (including
+            # the literal "null" of a sandboxed or file:// document) is not.
+            if origin and _hostname(urlparse(origin).netloc) not in allowed:
+                _send_error(self, 403, "cross-origin request refused")
+                return False
+            return True
+
         def do_HEAD(self):
             return self.do_GET()
 
         def do_GET(self):
+            if not self._guard():
+                return
             url = urlparse(self.path)
             qs = parse_qs(url.query or "")
             path = url.path
@@ -180,6 +262,8 @@ def build_handler(db_path: str, projects_dir: str):
             self.end_headers()
 
         def do_POST(self):
+            if not self._guard():
+                return
             url = urlparse(self.path)
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -224,6 +308,6 @@ def _scan_loop(db_path: str, projects_dir: str, interval: float = 30.0):
 
 def run(host: str, port: int, db_path: str, projects_dir: str):
     threading.Thread(target=_scan_loop, args=(db_path, projects_dir), daemon=True).start()
-    H = build_handler(db_path, projects_dir)
+    H = build_handler(db_path, projects_dir, bind_host=host)
     httpd = http.server.ThreadingHTTPServer((host, port), H)
     httpd.serve_forever()
